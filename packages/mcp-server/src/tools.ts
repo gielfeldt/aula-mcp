@@ -172,6 +172,65 @@ export function describeReadFailure(err: unknown): ReadFailure {
   };
 }
 
+/** Contacts per `profiles.getContactlist` page; a shorter page is the last. */
+const CONTACTS_PAGE_SIZE = 20;
+/** Stop paging here even if Aula keeps answering full pages. */
+const CONTACTS_MAX_PAGES = 15;
+
+export const CONTACT_FILTERS = ['child', 'guardian', 'employee', 'boy', 'girl'] as const;
+
+interface RawContact {
+  id?: number;
+  fullName?: string | null;
+  role?: string | null;
+  institutionRole?: string | null;
+  institutionName?: string | null;
+  relation?: string | null;
+  address?: {
+    street?: string | null;
+    postalCode?: number | null;
+    postalDistrict?: string | null;
+  } | null;
+  email?: string | null;
+  mobilePhoneNumber?: string | null;
+  homePhoneNumber?: string | null;
+  workPhoneNumber?: string | null;
+  birthday?: string | null;
+  relations?: RawContact[] | null;
+}
+
+/**
+ * One `profiles.getContactlist` entry, cut from ~50 fields (plus the same again
+ * per relation) to what a person reads in the app: name, role, relation and the
+ * contact details the family has consented to show. Absent values are dropped.
+ */
+export function slimContact(c: RawContact): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const set = (key: string, value: unknown): void => {
+    if (value !== null && value !== undefined && value !== '') out[key] = value;
+  };
+  set('id', c.id);
+  set('name', c.fullName);
+  set('role', c.institutionRole ?? c.role);
+  set('relation', c.relation);
+  set('institution', c.institutionName);
+  if (c.address?.street) {
+    set(
+      'address',
+      [c.address.street, [c.address.postalCode, c.address.postalDistrict].filter(Boolean).join(' ')]
+        .filter(Boolean)
+        .join(', '),
+    );
+  }
+  set('email', c.email);
+  set('mobile', c.mobilePhoneNumber);
+  set('homePhone', c.homePhoneNumber);
+  set('workPhone', c.workPhoneNumber);
+  set('birthday', c.birthday);
+  if (c.relations?.length) out.relations = c.relations.map(slimContact);
+  return out;
+}
+
 /** Messages up to this many characters are returned whole. */
 const SHORT_MESSAGE_CHARS = 600;
 /** Longer messages are cut to this many characters for `excerpt`. */
@@ -891,27 +950,61 @@ export function registerTools(server: McpServer, context: AulaContext): void {
     {
       title: 'Aula contact list (group members)',
       description:
-        'Members of one group or class, from aula.groups.list. Contains other ' +
-        'families’ personal data (names, birthdays) — only surface what the user asked for.',
+        'Members of one group or class (group ids from aula.groups.list), like the ' +
+        'Kontakter page in the app. `filter` picks who: `child` (each child with their ' +
+        'parents under `relations` — usually what you want for "who are X\'s parents"), ' +
+        '`guardian`, `employee` (teachers/staff), `boy` or `girl`. All pages are fetched ' +
+        'unless `page` is given. Contact details only appear where the family consented. ' +
+        'Contains other families\u2019 personal data — only surface what the user asked for.',
       inputSchema: {
         groupId: z.number().int(),
-        filter: z
-          .string()
+        filter: z.enum(CONTACT_FILTERS).optional().describe('Defaults to "child".'),
+        page: z
+          .number()
+          .int()
+          .min(1)
           .optional()
-          .describe('Aula role filter. Defaults to "child"; other values are untested.'),
-        page: z.number().int().min(1).optional().describe('1-based page. Defaults to 1.'),
+          .describe('1-based page of 20. Omit to get the whole group.'),
+        raw: z
+          .boolean()
+          .optional()
+          .describe('Return Aula\u2019s unabridged entries instead of the slim form.'),
       },
     },
     async (args) => {
       const client = await context.getClient();
       await context.getGuardianUserId();
-      return jsonContent(
-        await client.getContactList({
+      const fetchPage = async (page: number): Promise<RawContact[]> => {
+        const data = await client.getContactList({
           groupId: args.groupId,
           ...(args.filter ? { filter: args.filter } : {}),
-          ...(args.page !== undefined ? { page: args.page } : {}),
-        }),
-      );
+          page,
+        });
+        return Array.isArray(data) ? (data as RawContact[]) : [];
+      };
+      let contacts: RawContact[];
+      let truncated = false;
+      if (args.page !== undefined) {
+        contacts = await fetchPage(args.page);
+      } else {
+        contacts = [];
+        for (let page = 1; ; page++) {
+          const batch = await fetchPage(page);
+          contacts.push(...batch);
+          if (batch.length < CONTACTS_PAGE_SIZE) break;
+          if (page >= CONTACTS_MAX_PAGES) {
+            truncated = true;
+            break;
+          }
+        }
+      }
+      return jsonContent({
+        groupId: args.groupId,
+        filter: args.filter ?? 'child',
+        count: contacts.length,
+        ...(truncated ? { truncated: true } : {}),
+        contacts: args.raw ? contacts : contacts.map(slimContact),
+      });
     },
   );
 

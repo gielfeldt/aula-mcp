@@ -5,6 +5,7 @@ import {
   plainTextToHtml,
   previewMessage,
   registerTools,
+  slimContact,
   slimPost,
   validateSetTemplateArgs,
 } from './tools.ts';
@@ -460,5 +461,131 @@ describe('slimPost', () => {
     });
     expect(slim.attachments).toHaveLength(1);
     expect(slim.attachments?.[0]?.name).toBe('ok.pdf');
+  });
+});
+
+describe('slimContact', () => {
+  test('keeps what the Kontakter page shows and drops empty fields', () => {
+    const slim = slimContact({
+      id: 1,
+      fullName: 'Barn Eksempel',
+      role: 'child',
+      institutionRole: 'early-student',
+      institutionName: 'Skolen',
+      relation: null,
+      address: { street: 'Vejen 1', postalCode: 8000, postalDistrict: 'Aarhus C' },
+      email: '',
+      mobilePhoneNumber: null,
+      relations: [
+        {
+          id: 2,
+          fullName: 'Forælder Eksempel',
+          role: 'guardian',
+          relation: 'Mor',
+          address: null,
+          email: 'mor@example.dk',
+          mobilePhoneNumber: '12345678',
+        },
+      ],
+    });
+    expect(slim).toEqual({
+      id: 1,
+      name: 'Barn Eksempel',
+      role: 'early-student',
+      institution: 'Skolen',
+      address: 'Vejen 1, 8000 Aarhus C',
+      relations: [
+        {
+          id: 2,
+          name: 'Forælder Eksempel',
+          role: 'guardian',
+          relation: 'Mor',
+          email: 'mor@example.dk',
+          mobile: '12345678',
+        },
+      ],
+    });
+  });
+});
+
+describe('aula.contacts.list', () => {
+  type ToolHandler = (args: Record<string, unknown>) => Promise<{
+    content: Array<{ type: 'text'; text: string }>;
+  }>;
+
+  function register(total: number): {
+    call: (args: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    requests: Array<{ groupId: number; filter?: string; page?: number }>;
+  } {
+    const requests: Array<{ groupId: number; filter?: string; page?: number }> = [];
+    const fakeClient = {
+      async getContactList(opts: { groupId: number; filter?: string; page?: number }) {
+        requests.push(opts);
+        const page = opts.page ?? 1;
+        const start = (page - 1) * 20;
+        return Array.from({ length: Math.max(0, Math.min(20, total - start)) }, (_, i) => ({
+          id: start + i + 1,
+          fullName: `Kontakt ${start + i + 1}`,
+          profilePicture: { url: 'https://example.invalid/x.jpg' },
+        }));
+      },
+    };
+    const context = {
+      async getClient() {
+        return fakeClient;
+      },
+      async getGuardianUserId() {
+        return '5000';
+      },
+    };
+    let handler: ToolHandler | undefined;
+    const server = {
+      registerTool(name: string, _config: unknown, fn: ToolHandler) {
+        if (name === 'aula.contacts.list') handler = fn;
+      },
+    };
+    // biome-ignore lint/suspicious/noExplicitAny: structural stubs for McpServer/AulaContext
+    registerTools(server as any, context as any);
+    if (!handler) throw new Error('aula.contacts.list was not registered');
+    const registered = handler;
+    return {
+      async call(args) {
+        const res = await registered(args);
+        const [first] = res.content;
+        if (!first) throw new Error('tool returned no content');
+        return JSON.parse(first.text) as Record<string, unknown>;
+      },
+      requests,
+    };
+  }
+
+  test('fetches every page when no page is given', async () => {
+    const { call, requests } = register(45);
+    const out = await call({ groupId: 7 });
+    expect(out.count).toBe(45);
+    expect(requests.map((r) => r.page)).toEqual([1, 2, 3]);
+    expect(out.filter).toBe('child');
+  });
+
+  test('stops after a full last page with an empty one', async () => {
+    const { call, requests } = register(40);
+    const out = await call({ groupId: 7 });
+    expect(out.count).toBe(40);
+    expect(requests.map((r) => r.page)).toEqual([1, 2, 3]);
+  });
+
+  test('an explicit page fetches only that page', async () => {
+    const { call, requests } = register(45);
+    const out = await call({ groupId: 7, page: 2, filter: 'guardian' });
+    expect(out.count).toBe(20);
+    expect(requests).toEqual([{ groupId: 7, filter: 'guardian', page: 2 }]);
+  });
+
+  test('slim by default, raw on request', async () => {
+    const { call } = register(1);
+    const slim = (await call({ groupId: 7 })).contacts as Array<Record<string, unknown>>;
+    expect(slim[0]).toEqual({ id: 1, name: 'Kontakt 1' });
+    const raw = (await call({ groupId: 7, raw: true })).contacts as Array<Record<string, unknown>>;
+    expect(raw[0]?.profilePicture).toBeDefined();
   });
 });
