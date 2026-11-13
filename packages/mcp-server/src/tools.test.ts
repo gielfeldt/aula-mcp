@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { TokenStoreError } from '@aula-mcp/aula-auth';
 import { AulaApiError, AulaStepUpRequiredError, htmlToText } from '@aula-mcp/aula-client';
 import {
   describeReadFailure,
@@ -206,6 +207,15 @@ describe('describeReadFailure', () => {
     expect(server).toMatchObject({ error: 'unreadable', retryable: true });
     expect(describeReadFailure(new TypeError('fetch failed')).error).toBe('network');
     expect(describeReadFailure(new Error('boom')).error).toBe('unreadable');
+    expect(describeReadFailure(new TokenStoreError('No tokens on disk.')).error).toBe(
+      'session_expired',
+    );
+  });
+
+  test('a 410 is a retired API version, not an expired login', () => {
+    const out = describeReadFailure(new AulaApiError('x', 410, 'https://a/b', ''));
+    expect(out.error).toBe('unreadable');
+    expect(out.retryable).toBe(false);
   });
 
   test('never echoes raw error text for non-step-up failures', () => {
@@ -308,7 +318,7 @@ describe('aula.messages.list_threads content', () => {
       error: 'step_up_required',
       retryable: true,
     });
-    expect(String(out.threads[1]?.latest.action)).toContain('pnpm aula login');
+    expect(String(out.threads[1]?.latest.action)).toContain('aula login');
   });
 
   test('by default only unread threads are fetched', async () => {

@@ -6,6 +6,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { TokenStoreError } from '@aula-mcp/aula-auth';
 import type { AulaPost, ThreadMessage } from '@aula-mcp/aula-client';
 import {
   AulaApiError,
@@ -128,17 +129,20 @@ export function describeReadFailure(err: unknown): ReadFailure {
       error: 'step_up_required',
       message: err.message || 'This thread is sensitive and needs MitID step-up.',
       action:
-        'Ask the user to run `pnpm aula login` and approve it in the MitID app, then retry. ' +
+        'Ask the user to re-run the Aula login (`aula login`) and approve it in the MitID app, then retry. ' +
         'Other threads are unaffected.',
       retryable: true,
     };
   }
-  if (err instanceof AulaApiError && (err.status === 401 || err.status === 410)) {
+  // Only 401 means the login is gone. A 410 is Aula retiring the API version:
+  // AulaClient bumps the version and retries, so one that still surfaces is a
+  // version-handling failure, and logging in again would not help.
+  if (err instanceof AulaApiError && err.status === 401) {
     return {
       readable: false,
       error: 'session_expired',
       message: `Aula rejected the session (status ${err.status}).`,
-      action: 'Ask the user to run `pnpm aula login` again, then retry.',
+      action: 'Ask the user to re-run the Aula login (`aula login`), then retry.',
       retryable: true,
     };
   }
@@ -147,16 +151,17 @@ export function describeReadFailure(err: unknown): ReadFailure {
       readable: false,
       error: 'unreadable',
       message: `Aula returned status ${err.status} for this thread.`,
-      action: 'Retry later; if it persists, run `pnpm aula doctor`.',
+      action: 'Retry later; if it persists, run `aula doctor`.',
       retryable: err.status >= 500,
     };
   }
-  if (err instanceof Error && /No tokens/i.test(err.message)) {
+  // The token store throws this when there is no usable saved login.
+  if (err instanceof TokenStoreError) {
     return {
       readable: false,
       error: 'session_expired',
       message: 'No saved Aula login.',
-      action: 'Ask the user to run `pnpm aula login`.',
+      action: 'Ask the user to re-run the Aula login (`aula login`).',
       retryable: true,
     };
   }
@@ -167,7 +172,7 @@ export function describeReadFailure(err: unknown): ReadFailure {
       err instanceof TypeError
         ? 'Could not reach Aula.'
         : 'The thread could not be read for an unknown reason.',
-    action: 'Retry; if it persists, run `pnpm aula doctor`.',
+    action: 'Retry; if it persists, run `aula doctor`.',
     retryable: true,
   };
 }
@@ -1201,7 +1206,7 @@ export function registerTools(server: McpServer, context: AulaContext): void {
         'Returns subject + every message in the thread. If the thread is sensitive, ' +
         'this tool does not throw: it returns `{ readable: false, error, message, action, ' +
         'retryable }`. `error: "step_up_required"` means the user must approve a MitID ' +
-        'step-up (`pnpm aula login`); relay `action` to them.',
+        'step-up (`aula login`); relay `action` to them.',
       inputSchema: {
         threadId: z.number().int().positive(),
         page: z.number().int().min(0).default(0).optional(),
