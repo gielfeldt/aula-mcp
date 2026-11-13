@@ -8,7 +8,7 @@
 import type { Logger } from '@aula-mcp/aula-auth';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { AulaContext } from './aula-context.ts';
-import { registerTools } from './tools.ts';
+import { type AttachmentMode, registerTools } from './tools.ts';
 import { VERSION } from './version.ts';
 
 const INSTRUCTIONS = [
@@ -44,6 +44,8 @@ export interface McpAppOptions {
    *  for all its sessions so they share a single token refresh path, client
    *  and set of caches (and one token-file watcher) rather than one each. */
   context?: AulaContext;
+  /** See RegisterToolsOptions.attachments. Defaults to `disk`. */
+  attachments?: AttachmentMode;
 }
 
 export interface McpApp {
@@ -54,6 +56,7 @@ export interface McpApp {
 export function createMcpApp({
   logger,
   context = new AulaContext({ logger }),
+  attachments,
 }: McpAppOptions): McpApp {
   const mcp = new McpServer(
     {
@@ -65,6 +68,6 @@ export function createMcpApp({
       instructions: INSTRUCTIONS,
     },
   );
-  registerTools(mcp, context);
+  registerTools(mcp, context, attachments ? { attachments } : {});
   return { mcp, context };
 }
