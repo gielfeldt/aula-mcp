@@ -216,13 +216,13 @@ describe('previewMessage', () => {
 });
 
 describe('aula.messages.list_threads content', () => {
-  type H = (a: { includeContent?: boolean }) => Promise<{
+  type H = (a: { includeContent?: boolean | string }) => Promise<{
     content: Array<{ type: 'text'; text: string }>;
   }>;
 
   function run(
     getMessages: (id: number) => Promise<{ messages: unknown[] }>,
-  ): (a: { includeContent?: boolean }) => Promise<Record<string, unknown>> {
+  ): (a: { includeContent?: boolean | string }) => Promise<Record<string, unknown>> {
     const client = {
       async getThreadsPage() {
         return {
@@ -271,9 +271,33 @@ describe('aula.messages.list_threads content', () => {
         ],
       };
     });
-    const out = (await list({})) as { threads: Array<{ latest: Record<string, unknown> }> };
+    const out = (await list({ includeContent: 'all' })) as {
+      threads: Array<{ latest: Record<string, unknown> }>;
+    };
     expect(out.threads[0]?.latest.text).toBe('nyeste');
     expect(out.threads[1]?.latest).toEqual({ error: 'step_up_required' });
+  });
+
+  test('by default only unread threads are fetched', async () => {
+    const fetched: number[] = [];
+    const list = run(async (id) => {
+      fetched.push(id);
+      return { messages: [{ text: { plain: 'ny' }, sendDateTime: '2026-10-02' }] };
+    });
+    const out = (await list({})) as { threads: Array<Record<string, unknown>> };
+    expect(fetched).toEqual([1]);
+    expect(out.threads[0]?.latest).toBeDefined();
+    expect(out.threads[1]?.latest).toBeUndefined();
+  });
+
+  test('includeContent: true still means every thread', async () => {
+    const fetched: number[] = [];
+    const list = run(async (id) => {
+      fetched.push(id);
+      return { messages: [] };
+    });
+    await list({ includeContent: true });
+    expect(fetched.sort()).toEqual([1, 2]);
   });
 
   test('includeContent: false skips the per-thread fetch', async () => {

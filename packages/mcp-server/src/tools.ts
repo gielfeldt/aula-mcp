@@ -877,7 +877,7 @@ export function registerTools(server: McpServer, context: AulaContext): void {
         'not seen, so keep calling with `page` + 1 before concluding anything about the ' +
         'mailbox as a whole (e.g. "no unread messages"). A single call answers "what ' +
         'arrived recently", never "what does the mailbox contain". By default each ' +
-        'thread also carries `latest`: sender, time, attachment flag and the newest ' +
+        'UNREAD thread also carries `latest`: sender, time, attachment flag and the newest ' +
         'message — whole in `text` when short, otherwise an `excerpt` with ' +
         '`needsSummary: true`. For those, fetch aula.messages.get_thread if you need ' +
         'more and summarise it for the user rather than pasting it. A thread whose ' +
@@ -885,11 +885,12 @@ export function registerTools(server: McpServer, context: AulaContext): void {
       inputSchema: {
         page: z.number().int().min(0).default(0).optional(),
         includeContent: z
-          .boolean()
+          .union([z.enum(['unread', 'all', 'none']), z.boolean()])
           .optional()
           .describe(
-            'Default true: fetch the newest message of every thread (one extra call each). ' +
-              'Pass false for the bare thread list.',
+            "Which threads get `latest` (one extra Aula call each). Default 'unread' — " +
+              "usually what needs summarising. 'all' for every thread on the page (21 calls " +
+              "instead of 1), 'none' for the bare list. true/false mean 'all'/'none'.",
           ),
         pageSize: z
           .number()
@@ -909,8 +910,18 @@ export function registerTools(server: McpServer, context: AulaContext): void {
         ...(args.page !== undefined ? { page: args.page } : {}),
         ...(args.pageSize !== undefined ? { pageSize: args.pageSize } : {}),
       });
-      if (args.includeContent === false) return jsonContent(page);
+      const include =
+        args.includeContent === true
+          ? 'all'
+          : args.includeContent === false
+            ? 'none'
+            : (args.includeContent ?? 'unread');
+      if (include === 'none') return jsonContent(page);
+      // Agents call list_threads a lot, often just to ask "anything new?", and
+      // every thread fetched is one more Aula request. Read threads keep their
+      // `lastMessage` sender and time from the list itself.
       const threads = await mapLimit(page.threads, 5, async (thread) => {
+        if (include === 'unread' && thread.read) return thread;
         try {
           const { messages } = await client.getMessagesForThread(thread.id);
           const newest = newestMessage(messages);
