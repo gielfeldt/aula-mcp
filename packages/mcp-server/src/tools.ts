@@ -6,8 +6,10 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { AulaPost } from '@aula-mcp/aula-client';
+import { TokenStoreError } from '@aula-mcp/aula-auth';
+import type { AulaPost, ThreadMessage } from '@aula-mcp/aula-client';
 import {
+  AulaApiError,
   AulaStepUpRequiredError,
   htmlToText,
   isoDate,
@@ -315,6 +317,138 @@ export function slimContact(c: RawContact): Record<string, unknown> {
   set('workPhone', c.workPhoneNumber);
   set('birthday', c.birthday);
   if (c.relations?.length) out.relations = c.relations.map(slimContact);
+  return out;
+}
+
+export type ReadFailureReason = 'step_up_required' | 'session_expired' | 'network' | 'unreadable';
+
+/** Why a thread could not be read, in a shape the client can act on. */
+export interface ReadFailure {
+  readable: false;
+  /** Machine-readable reason (kept under `error` for existing consumers). */
+  error: ReadFailureReason;
+  message: string;
+  /** What to tell the user / do next. */
+  action: string;
+  retryable: boolean;
+}
+
+/** Map a thrown error to a ReadFailure. Never echoes raw error text except
+ *  Aula's own step-up message, so tokens/URLs can't leak into tool output. */
+export function describeReadFailure(err: unknown): ReadFailure {
+  if (err instanceof AulaStepUpRequiredError) {
+    return {
+      readable: false,
+      error: 'step_up_required',
+      message: err.message || 'This thread is sensitive and needs MitID step-up.',
+      action:
+        'Ask the user to re-run the Aula login (`aula login`) and approve it in the MitID app, then retry. ' +
+        'Other threads are unaffected.',
+      retryable: true,
+    };
+  }
+  // Only 401 means the login is gone. A 410 is Aula retiring the API version:
+  // AulaClient bumps the version and retries, so one that still surfaces is a
+  // version-handling failure, and logging in again would not help.
+  if (err instanceof AulaApiError && err.status === 401) {
+    return {
+      readable: false,
+      error: 'session_expired',
+      message: `Aula rejected the session (status ${err.status}).`,
+      action: 'Ask the user to re-run the Aula login (`aula login`), then retry.',
+      retryable: true,
+    };
+  }
+  if (err instanceof AulaApiError) {
+    return {
+      readable: false,
+      error: 'unreadable',
+      message: `Aula returned status ${err.status} for this thread.`,
+      action: 'Retry later; if it persists, run `aula doctor`.',
+      retryable: err.status >= 500,
+    };
+  }
+  // The token store throws this when there is no usable saved login.
+  if (err instanceof TokenStoreError) {
+    return {
+      readable: false,
+      error: 'session_expired',
+      message: 'No saved Aula login.',
+      action: 'Ask the user to re-run the Aula login (`aula login`).',
+      retryable: true,
+    };
+  }
+  return {
+    readable: false,
+    error: err instanceof TypeError ? 'network' : 'unreadable',
+    message:
+      err instanceof TypeError
+        ? 'Could not reach Aula.'
+        : 'The thread could not be read for an unknown reason.',
+    action: 'Retry; if it persists, run `aula doctor`.',
+    retryable: true,
+  };
+}
+
+/** Messages up to this many characters are returned whole. */
+const SHORT_MESSAGE_CHARS = 600;
+/** Longer messages are cut to this many characters for `excerpt`. */
+const EXCERPT_CHARS = 300;
+
+export interface MessagePreview {
+  sender?: string;
+  sentAt?: string;
+  hasAttachments: boolean;
+  /** Plain-text length of the full message. */
+  length: number;
+  /** Short messages: the whole text. Long ones: omitted, see `excerpt`. */
+  text?: string;
+  /** Long messages: the opening, cut at a word boundary. */
+  excerpt?: string;
+  /** True when the message is long — summarise it for the user, don't paste it. */
+  needsSummary: boolean;
+}
+
+/** Whole text when short, an excerpt plus a flag to summarise when long. */
+export function previewMessage(msg: ThreadMessage): MessagePreview {
+  const text = htmlToText(msg.text?.html ?? msg.text?.plain ?? '').trim();
+  const base = {
+    ...(msg.sender?.fullName ? { sender: msg.sender.fullName } : {}),
+    ...(msg.sendDateTime ? { sentAt: msg.sendDateTime } : {}),
+    hasAttachments: msg.hasAttachments === true || (msg.attachments?.length ?? 0) > 0,
+    length: text.length,
+  };
+  if (text.length <= SHORT_MESSAGE_CHARS) return { ...base, text, needsSummary: false };
+  const cut = text.slice(0, EXCERPT_CHARS);
+  const lastSpace = cut.lastIndexOf(' ');
+  const excerpt = `${(lastSpace > EXCERPT_CHARS / 2 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+  return { ...base, excerpt, needsSummary: true };
+}
+
+/** Newest message of a thread's messages, by send time (falls back to last). */
+function newestMessage(messages: ThreadMessage[]): ThreadMessage | undefined {
+  let best: ThreadMessage | undefined;
+  for (const m of messages) {
+    if (!best || (m.sendDateTime ?? '') >= (best.sendDateTime ?? '')) best = m;
+  }
+  return best;
+}
+
+/** Run `fn` over `items` with at most `limit` in flight, keeping order. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return out;
 }
 
@@ -1073,9 +1207,25 @@ export function registerTools(
         'hasMorePages }`: when `hasMorePages` is true there are older threads you have ' +
         'not seen, so keep calling with `page` + 1 before concluding anything about the ' +
         'mailbox as a whole (e.g. "no unread messages"). A single call answers "what ' +
-        'arrived recently", never "what does the mailbox contain".',
+        'arrived recently", never "what does the mailbox contain". By default each ' +
+        'UNREAD thread also carries `latest`: sender, time, attachment flag and the newest ' +
+        'message — whole in `text` when short, otherwise an `excerpt` with ' +
+        '`needsSummary: true`. For those, fetch aula.messages.get_thread if you need ' +
+        'more and summarise it for the user rather than pasting it. A thread whose ' +
+        'content cannot be read gets `latest: { readable: false, error, message, action, ' +
+        'retryable }` and, for sensitive threads, `sensitive: true`; its subject and ' +
+        'sender are still listed. Show those rows as "needs MitID approval" and relay ' +
+        '`action` once, not per thread.',
       inputSchema: {
         page: z.number().int().min(0).default(0).optional(),
+        includeContent: z
+          .union([z.enum(['unread', 'all', 'none']), z.boolean()])
+          .optional()
+          .describe(
+            "Which threads get `latest` (one extra Aula call each). Default 'unread' — " +
+              "usually what needs summarising. 'all' for every thread on the page (21 calls " +
+              "instead of 1), 'none' for the bare list. true/false mean 'all'/'none'.",
+          ),
         pageSize: z
           .number()
           .int()
@@ -1094,7 +1244,39 @@ export function registerTools(
         ...(args.page !== undefined ? { page: args.page } : {}),
         ...(args.pageSize !== undefined ? { pageSize: args.pageSize } : {}),
       });
-      return jsonContent(page);
+      const include =
+        args.includeContent === true
+          ? 'all'
+          : args.includeContent === false
+            ? 'none'
+            : (args.includeContent ?? 'unread');
+      if (include === 'none') return jsonContent(page);
+      // Agents call list_threads a lot, often just to ask "anything new?", and
+      // every thread fetched is one more Aula request. Read threads keep their
+      // `lastMessage` sender and time from the list itself.
+      const threads = await mapLimit(page.threads, 5, async (thread) => {
+        if (include === 'unread' && thread.read) return thread;
+        try {
+          const { messages } = await client.getMessagesForThread(thread.id);
+          const newest = newestMessage(messages);
+          return {
+            ...thread,
+            latest: newest
+              ? { readable: true, ...previewMessage(newest) }
+              : { readable: false, error: 'no_messages', retryable: false },
+          };
+        } catch (err) {
+          const failure = describeReadFailure(err);
+          // Thread metadata (subject, sender, unread) is kept; only the body is
+          // withheld. `sensitive` lets the client render a clear row for it.
+          return {
+            ...thread,
+            ...(failure.error === 'step_up_required' ? { sensitive: true } : {}),
+            latest: failure,
+          };
+        }
+      });
+      return jsonContent({ ...page, threads });
     },
   );
 
@@ -1281,8 +1463,9 @@ export function registerTools(
       title: 'Read a single thread',
       description:
         'Returns subject + every message in the thread. If the thread is sensitive, ' +
-        'this tool returns an error code that means the user must MitID step-up to read it ' +
-        '(currently a fresh `aula login` from the CLI).',
+        'this tool does not throw: it returns `{ readable: false, error, message, action, ' +
+        'retryable }`. `error: "step_up_required"` means the user must approve a MitID ' +
+        'step-up (`aula login`); relay `action` to them.',
       inputSchema: {
         threadId: z.number().int().positive(),
         page: z.number().int().min(0).default(0).optional(),
@@ -1306,14 +1489,7 @@ export function registerTools(
           }),
         );
       } catch (e) {
-        if (e instanceof AulaStepUpRequiredError) {
-          return jsonContent({
-            error: 'step_up_required',
-            message: e.message,
-            hint: 'Run `aula login` again to refresh your session, then retry.',
-          });
-        }
-        throw e;
+        return jsonContent({ threadId: args.threadId, ...describeReadFailure(e) });
       }
     },
   );
