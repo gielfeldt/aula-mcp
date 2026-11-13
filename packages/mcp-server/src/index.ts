@@ -5,4 +5,5 @@ export {
   type DiscoveredChild,
   type DiscoverManifest,
 } from './discover.ts';
-export { registerTools } from './tools.ts';
+export { createMcpApp, type McpApp, type McpAppOptions } from './setup.ts';
+export { type AttachmentMode, type RegisterToolsOptions, registerTools } from './tools.ts';

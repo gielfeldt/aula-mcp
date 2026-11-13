@@ -13,7 +13,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { AulaTokens } from '@aula-mcp/aula-auth';
@@ -22,7 +22,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { Hono } from 'hono';
 import type { AulaContext } from './aula-context.ts';
-import { registerTools } from './tools.ts';
+import { type RegisterToolsOptions, registerTools } from './tools.ts';
 
 const TOKENS: AulaTokens = {
   access_token: 'AT',
@@ -182,13 +182,16 @@ interface Harness {
  * AULA_MCP_WRITE at `registerTools` time, so covering both states needs two
  * independently-registered servers in the same file.
  */
-async function createHarness(context: AulaContext): Promise<Harness> {
+async function createHarness(
+  context: AulaContext,
+  options: RegisterToolsOptions = {},
+): Promise<Harness> {
   const app = new Hono();
   const mcp = new McpServer(
     { name: 'aula-mcp-test', version: '0.0.0-test' },
     { capabilities: { tools: {} } },
   );
-  registerTools(mcp, context);
+  registerTools(mcp, context, options);
   // Stateful mode — the SDK forbids reusing a stateless transport across
   // requests, which a multi-test suite necessarily does. Mirror what
   // production does in server.ts.
@@ -736,7 +739,7 @@ describe('MCP server: tools/call(aula.messages.get_attachment)', () => {
     stubFetch(() => new Response('%PDF-1.7 nyhed'));
     const out = await harness.call(29, 'aula.posts.get_attachment', {
       postId: 314,
-      url: 'https://cdn.test/post-attachment',
+      url: 'https://media-prod.aula.dk/post-attachment',
       filename: 'Sommerfest program.pdf',
     });
     expect(out.ok).toBe(true);
@@ -744,7 +747,7 @@ describe('MCP server: tools/call(aula.messages.get_attachment)', () => {
     expect(out.bytes).toBe(14);
     // The posts tool has no mediaType to pass, so the key stays off.
     expect('mediaType' in out).toBe(false);
-    expect(requested).toEqual(['https://cdn.test/post-attachment']);
+    expect(requested).toEqual(['https://media-prod.aula.dk/post-attachment']);
   });
 
   test('keeps Danish letters in the on-disk filename', async () => {
@@ -754,7 +757,7 @@ describe('MCP server: tools/call(aula.messages.get_attachment)', () => {
     stubFetch(() => new Response('%PDF-1.7'));
     const out = await harness.call(31, 'aula.posts.get_attachment', {
       postId: 42,
-      url: 'https://cdn.test/dansk',
+      url: 'https://media-prod.aula.dk/dansk',
       filename: 'Bålhytten på Ærø - lørdag.pdf',
     });
     expect(out.ok).toBe(true);
@@ -767,7 +770,7 @@ describe('MCP server: tools/call(aula.messages.get_attachment)', () => {
     stubFetch(() => new Response('x'));
     const out = await harness.call(32, 'aula.posts.get_attachment', {
       postId: 42,
-      url: 'https://cdn.test/dansk',
+      url: 'https://media-prod.aula.dk/dansk',
       filename: '../Bålhytten/ø\u0000.pdf',
     });
     expect(out.path).toBe(join(dir, 'post-42-.._Bålhytten_ø_.pdf'));
@@ -778,10 +781,194 @@ describe('MCP server: tools/call(aula.messages.get_attachment)', () => {
     stubFetch(() => new Response('gone', { status: 404 }));
     const out = await harness.call(30, 'aula.posts.get_attachment', {
       postId: 314,
-      url: 'https://cdn.test/post-attachment',
+      url: 'https://media-prod.aula.dk/post-attachment',
       filename: 'Sommerfest program.pdf',
     });
     expect(out.error).toBe('download_failed');
     expect(out.httpStatus).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// attachments: 'inline' — what a server shared between users runs with.
+// ---------------------------------------------------------------------------
+
+/** The smallest PDF pdf.js reads text from, with a correct xref table. */
+function tinyPdf(text: string): Uint8Array {
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Contents 4 0 R ' +
+      '/Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${`BT /F1 12 Tf 10 50 Td (${text}) Tj ET`.length} >>\nstream\n` +
+      `BT /F1 12 Tf 10 50 Td (${text}) Tj ET\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+  ];
+  let out = '%PDF-1.4\n';
+  const offsets: number[] = [];
+  objects.forEach((body, i) => {
+    offsets.push(out.length);
+    out += `${i + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = out.length;
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const o of offsets) out += `${String(o).padStart(10, '0')} 00000 n \n`;
+  out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return new TextEncoder().encode(out);
+}
+
+const PNG_1X1 = Uint8Array.from(
+  atob(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+  ),
+  (c) => c.charCodeAt(0),
+);
+
+describe("MCP server: attachments: 'inline'", () => {
+  let inlineHarness: Harness;
+  let dir: string;
+  let previousDir: string | undefined;
+  let realFetch: typeof globalThis.fetch;
+  let requested: string[] = [];
+  let redirectModes: (RequestInit['redirect'] | undefined)[] = [];
+
+  beforeAll(async () => {
+    inlineHarness = await createHarness(fakeContext({ threads: THREADS }), {
+      attachments: 'inline',
+    });
+    // Point the disk mode's directory somewhere watchable: inline must leave it empty.
+    dir = await mkdtemp(join(tmpdir(), 'aula-mcp-inline-'));
+    previousDir = setEnv('AULA_MCP_ATTACHMENTS_DIR', dir);
+    realFetch = globalThis.fetch;
+  });
+
+  afterAll(async () => {
+    globalThis.fetch = realFetch;
+    setEnv('AULA_MCP_ATTACHMENTS_DIR', previousDir);
+    await rm(dir, { recursive: true, force: true });
+    await inlineHarness.close();
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  function stubFetch(respond: (url: string) => Response): void {
+    requested = [];
+    redirectModes = [];
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      requested.push(url);
+      redirectModes.push(init?.redirect);
+      return Promise.resolve(respond(url));
+    }) as unknown as typeof globalThis.fetch;
+  }
+
+  test('does not register aula.utils.extract_pdf_text', async () => {
+    const names = await inlineHarness.toolNames(100);
+    expect(names).not.toContain('aula.utils.extract_pdf_text');
+    expect(names).toContain('aula.messages.get_attachment');
+    expect(names).toContain('aula.posts.get_attachment');
+  });
+
+  test('aula.discover does not point the agent at the missing tool', async () => {
+    const manifest = await inlineHarness.call(101, 'aula.discover', {});
+    expect(JSON.stringify(manifest)).not.toContain('aula.utils.extract_pdf_text');
+  });
+
+  test('returns a PDF attachment as text', async () => {
+    stubFetch(() => new Response(tinyPdf('Madplan uge 47')));
+    const out = await inlineHarness.call(102, 'aula.messages.get_attachment', {
+      threadId: 77,
+      attachmentIndex: 0,
+    });
+    expect(out.ok).toBe(true);
+    expect(out.mediaType).toBe('application/pdf');
+    expect(out.text).toContain('Madplan uge 47');
+    expect(out.pages).toBe(1);
+    expect('path' in out).toBe(false);
+  });
+
+  test('returns an image attachment as image content', async () => {
+    stubFetch(() => new Response(PNG_1X1));
+    const r = await inlineHarness.rpc({
+      jsonrpc: '2.0',
+      id: 103,
+      method: 'tools/call',
+      params: {
+        name: 'aula.posts.get_attachment',
+        arguments: { postId: 1, url: 'https://media-prod.aula.dk/x.png', filename: 'x.png' },
+      },
+    });
+    const content = (r.result as { content: { type: string; mimeType?: string; data?: string }[] })
+      .content;
+    expect(content.map((c) => c.type)).toEqual(['text', 'image']);
+    expect(content[1]?.mimeType).toBe('image/png');
+    expect(content[1]?.data).toBe(Buffer.from(PNG_1X1).toString('base64'));
+  });
+
+  test('declines other file types instead of saving them', async () => {
+    stubFetch(() => new Response('just some text'));
+    const out = await inlineHarness.call(104, 'aula.messages.get_attachment', {
+      threadId: 77,
+      attachmentIndex: 1,
+    });
+    expect(out.ok).toBe(false);
+    expect(out.error).toBe('unsupported_attachment');
+  });
+});
+
+describe('aula.posts.get_attachment only fetches from aula.dk', () => {
+  let realFetch: typeof globalThis.fetch;
+  let requested: string[] = [];
+  let redirectModes: (RequestInit['redirect'] | undefined)[] = [];
+
+  beforeAll(() => {
+    realFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  function stubFetch(): void {
+    requested = [];
+    redirectModes = [];
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+      requested.push(String(input));
+      redirectModes.push(init?.redirect);
+      return Promise.resolve(new Response('%PDF-1.7'));
+    }) as unknown as typeof globalThis.fetch;
+  }
+
+  for (const url of [
+    'http://media-prod.aula.dk/plain-http.pdf',
+    'https://evil.example/x.pdf',
+    'https://aula.dk.evil.example/x.pdf',
+    'https://10.0.0.1/x.pdf',
+    'https://kubernetes.default.svc/api',
+  ]) {
+    test(`refuses ${url} without fetching it`, async () => {
+      stubFetch();
+      const out = await harness.call(110, 'aula.posts.get_attachment', {
+        postId: 1,
+        url,
+        filename: 'x.pdf',
+      });
+      expect(out.error).toBe('url_not_allowed');
+      expect(requested).toEqual([]);
+    });
+  }
+
+  test('refuses to follow redirects from an allowed host', async () => {
+    stubFetch();
+    await harness.call(111, 'aula.posts.get_attachment', {
+      postId: 1,
+      url: 'https://media-prod.aula.dk/x.pdf',
+      filename: 'x.pdf',
+    });
+    expect(requested).toEqual(['https://media-prod.aula.dk/x.pdf']);
+    expect(redirectModes).toEqual(['error']);
   });
 });

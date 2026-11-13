@@ -23,35 +23,87 @@ import { buildDiscoverManifest } from './discover.ts';
 
 const ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
+/** How the attachment tools hand back what they download. */
+export type AttachmentMode = 'disk' | 'inline';
+
+export interface RegisterToolsOptions {
+  /**
+   * `disk` (default): attachments are written to AULA_MCP_ATTACHMENTS_DIR and
+   * the tools return a path, which aula.utils.extract_pdf_text can then read.
+   * Right for a single user running the server on their own machine.
+   *
+   * `inline`: nothing touches disk. PDFs come back as text, images as image
+   * content, and aula.utils.extract_pdf_text is not registered at all. Use
+   * this whenever the server is shared: a tool that reads any local path, and
+   * a download directory every user writes to, let one user's agent read
+   * another user's attachments — or any other file the process can read.
+   */
+  attachments?: AttachmentMode;
+}
+
 /**
- * Download a CloudFront presigned attachment to a local file and return a
- * result payload. Shared by aula.messages.get_attachment and
- * aula.posts.get_attachment — the two differ only in how they arrive at a
- * URL, not in what they do with it.
+ * Whether `raw` is somewhere Aula serves attachments from. aula.posts.get_attachment
+ * takes its URL from the model, so without this check the server fetches
+ * whatever it is told to — including hosts on its own private network.
+ */
+export function isAulaAttachmentUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  return (
+    url.protocol === 'https:' && (url.hostname === 'aula.dk' || url.hostname.endsWith('.aula.dk'))
+  );
+}
+
+type FetchedAttachment = { ok: true; buf: Buffer } | { ok: false; result: Record<string, unknown> };
+
+/**
+ * Download a CloudFront presigned attachment into memory, enforcing the size
+ * cap. Shared by aula.messages.get_attachment and aula.posts.get_attachment —
+ * the two differ only in how they arrive at a URL, not in what they do with it.
  *
  * Deliberately plain `fetch`, not AulaHttpClient: the signature in the URL
  * IS the auth, and Aula cookies / Authorization headers can interfere.
  */
-async function downloadAttachmentToDisk(args: {
+async function fetchAttachment(args: {
   url: string;
   filename: string;
-  /** Prefixed onto the on-disk name to keep sources from colliding. */
-  prefix: string;
-  mediaType?: string;
-}): Promise<Record<string, unknown>> {
-  const res = await fetch(args.url);
+  /** Set when the URL came from the model rather than from Aula itself. */
+  untrustedUrl?: boolean;
+}): Promise<FetchedAttachment> {
+  if (args.untrustedUrl && !isAulaAttachmentUrl(args.url)) {
+    return {
+      ok: false,
+      result: {
+        error: 'url_not_allowed',
+        filename: args.filename,
+        message: 'Only https attachment URLs on aula.dk are downloaded.',
+      },
+    };
+  }
+  // A redirect could lead an allowed URL somewhere that is not.
+  const res = await fetch(args.url, args.untrustedUrl ? { redirect: 'error' } : undefined);
   if (!res.ok) {
     const body = (await res.text()).slice(0, 300);
-    return { error: 'download_failed', httpStatus: res.status, filename: args.filename, body };
+    return {
+      ok: false,
+      result: { error: 'download_failed', httpStatus: res.status, filename: args.filename, body },
+    };
   }
 
   const declared = Number(res.headers.get('content-length') ?? '0');
   if (declared > ATTACHMENT_MAX_BYTES) {
     return {
-      error: 'attachment_too_large',
-      filename: args.filename,
-      bytes: declared,
-      maxBytes: ATTACHMENT_MAX_BYTES,
+      ok: false,
+      result: {
+        error: 'attachment_too_large',
+        filename: args.filename,
+        bytes: declared,
+        maxBytes: ATTACHMENT_MAX_BYTES,
+      },
     };
   }
 
@@ -59,13 +111,26 @@ async function downloadAttachmentToDisk(args: {
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.byteLength > ATTACHMENT_MAX_BYTES) {
     return {
-      error: 'attachment_too_large',
-      filename: args.filename,
-      bytes: buf.byteLength,
-      maxBytes: ATTACHMENT_MAX_BYTES,
+      ok: false,
+      result: {
+        error: 'attachment_too_large',
+        filename: args.filename,
+        bytes: buf.byteLength,
+        maxBytes: ATTACHMENT_MAX_BYTES,
+      },
     };
   }
+  return { ok: true, buf };
+}
 
+/** Write a downloaded attachment to AULA_MCP_ATTACHMENTS_DIR and describe it. */
+async function saveAttachmentToDisk(args: {
+  buf: Buffer;
+  filename: string;
+  /** Prefixed onto the on-disk name to keep sources from colliding. */
+  prefix: string;
+  mediaType?: string;
+}): Promise<Record<string, unknown>> {
   const baseDir = process.env.AULA_MCP_ATTACHMENTS_DIR ?? join(tmpdir(), 'aula-attachments');
   await mkdir(baseDir, { recursive: true });
   // `\w` is ASCII-only, so it mangled every Danish attachment it touched —
@@ -75,15 +140,104 @@ async function downloadAttachmentToDisk(args: {
   // punishing æ, ø and å for not being ASCII.
   const safeName = args.filename.replace(/[^\p{L}\p{N}.\-_ ]+/gu, '_');
   const path = join(baseDir, `${args.prefix}-${safeName}`);
-  await writeFile(path, buf, { mode: 0o600 });
+  await writeFile(path, args.buf, { mode: 0o600 });
 
   return {
     ok: true,
     path,
     filename: args.filename,
-    bytes: buf.length,
+    bytes: args.buf.length,
     ...(args.mediaType ? { mediaType: args.mediaType } : {}),
   };
+}
+
+/**
+ * Text of a PDF. pdf-parse is imported lazily: it pulls in pdf.js, and a
+ * server whose user never opens a PDF should not pay for that at boot.
+ */
+async function extractPdfText(
+  data: Buffer,
+): Promise<
+  { ok: true; text: string; pages: number; info: unknown } | { ok: false; message: string }
+> {
+  let parser: { getText(): Promise<PdfTextResult>; destroy?(): Promise<void> } | undefined;
+  try {
+    const { PDFParse } = (await import('pdf-parse')) as unknown as {
+      PDFParse: new (opts: {
+        data: Buffer;
+      }) => {
+        getText(): Promise<PdfTextResult>;
+        destroy?(): Promise<void>;
+      };
+    };
+    parser = new PDFParse({ data });
+    const result = await parser.getText();
+    return { ok: true, text: result.text, pages: result.total, info: result.info };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  } finally {
+    // v2 holds pdf.js resources open; release them even on the error path.
+    if (parser?.destroy) await parser.destroy();
+  }
+}
+
+/** Images small enough to hand to the model as image content. */
+const INLINE_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+
+/** Media type from the file's first bytes; the name and Aula's label can lie. */
+export function sniffMediaType(buf: Buffer): string | undefined {
+  const head = buf.subarray(0, 12);
+  if (head.subarray(0, 5).toString('latin1') === '%PDF-') return 'application/pdf';
+  if (head[0] === 0x89 && head.subarray(1, 4).toString('latin1') === 'PNG') return 'image/png';
+  if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'image/jpeg';
+  if (head.subarray(0, 4).toString('latin1') === 'GIF8') return 'image/gif';
+  if (
+    head.subarray(0, 4).toString('latin1') === 'RIFF' &&
+    head.subarray(8, 12).toString('latin1') === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  return undefined;
+}
+
+type ToolContent =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string };
+
+/** Hand a downloaded attachment straight back to the model, never touching disk. */
+async function inlineAttachment(args: {
+  buf: Buffer;
+  filename: string;
+  mediaType?: string;
+}): Promise<{ content: ToolContent[] }> {
+  const sniffed = sniffMediaType(args.buf);
+  const meta = {
+    filename: args.filename,
+    bytes: args.buf.length,
+    mediaType: sniffed ?? args.mediaType ?? 'application/octet-stream',
+  };
+  if (sniffed === 'application/pdf') {
+    const pdf = await extractPdfText(args.buf);
+    return jsonContent(
+      pdf.ok
+        ? { ok: true, ...meta, pages: pdf.pages, text: pdf.text }
+        : { ok: false, ...meta, error: 'failed_to_read_pdf', message: pdf.message },
+    );
+  }
+  if (sniffed?.startsWith('image/') && args.buf.length <= INLINE_IMAGE_MAX_BYTES) {
+    return {
+      content: [
+        { type: 'text', text: JSON.stringify({ ok: true, ...meta }, null, 2) },
+        { type: 'image', data: args.buf.toString('base64'), mimeType: sniffed },
+      ],
+    };
+  }
+  return jsonContent({
+    ok: false,
+    ...meta,
+    error: 'unsupported_attachment',
+    message: 'Only PDFs (as text) and images up to 5 MB can be shown. Open this one in Aula.',
+  });
 }
 
 function jsonContent(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
@@ -288,7 +442,13 @@ export function validateSetTemplateArgs(args: SetTemplateArgs): string[] {
   return problems;
 }
 
-export function registerTools(server: McpServer, context: AulaContext): void {
+export function registerTools(
+  server: McpServer,
+  context: AulaContext,
+  options: RegisterToolsOptions = {},
+): void {
+  const inline = options.attachments === 'inline';
+
   // --- aula.discover -------------------------------------------------------
 
   server.registerTool(
@@ -304,6 +464,12 @@ export function registerTools(server: McpServer, context: AulaContext): void {
     },
     async () => {
       const manifest = await buildDiscoverManifest(context);
+      if (inline) {
+        // aula.utils.extract_pdf_text is not registered: attachments arrive as text.
+        for (const capability of Object.values(manifest.capabilities)) {
+          capability.tools = capability.tools.filter((t) => t !== 'aula.utils.extract_pdf_text');
+        }
+      }
       return jsonContent(manifest);
     },
   );
@@ -1165,10 +1331,13 @@ export function registerTools(server: McpServer, context: AulaContext): void {
   server.registerTool(
     'aula.messages.get_attachment',
     {
-      title: 'Download a thread attachment to local disk',
+      title: inline ? 'Read a thread attachment' : 'Download a thread attachment to local disk',
       description:
-        'Download an attachment from a thread message and write it to a ' +
-        'local temporary file, returning the file path. Prefer this over ' +
+        (inline
+          ? 'Fetch an attachment from a thread message and return it: PDFs as ' +
+            'text, images as images. Prefer this over '
+          : 'Download an attachment from a thread message and write it to a ' +
+            'local temporary file, returning the file path. Prefer this over ') +
         'passing Aula attachment URLs through the model — CloudFront ' +
         'presigned URLs are long opaque blobs that LLMs often mangle when ' +
         'echoing into tool calls (MalformedSignature / AccessDenied 403). ' +
@@ -1199,13 +1368,19 @@ export function registerTools(server: McpServer, context: AulaContext): void {
           totalAttachments: flat.length,
         });
       }
-      const result = await downloadAttachmentToDisk({
-        url: file.url,
-        filename: file.name ?? `attachment-${args.attachmentIndex}.bin`,
-        prefix: `${args.threadId}-${args.attachmentIndex}`,
-        ...(file.mediaType ? { mediaType: file.mediaType } : {}),
-      });
-      return jsonContent(result);
+      const filename = file.name ?? `attachment-${args.attachmentIndex}.bin`;
+      const fetched = await fetchAttachment({ url: file.url, filename });
+      if (!fetched.ok) return jsonContent(fetched.result);
+      const mediaType = file.mediaType ? { mediaType: file.mediaType } : {};
+      if (inline) return inlineAttachment({ buf: fetched.buf, filename, ...mediaType });
+      return jsonContent(
+        await saveAttachmentToDisk({
+          buf: fetched.buf,
+          filename,
+          prefix: `${args.threadId}-${args.attachmentIndex}`,
+          ...mediaType,
+        }),
+      );
     },
   );
 
@@ -1218,10 +1393,13 @@ export function registerTools(server: McpServer, context: AulaContext): void {
   server.registerTool(
     'aula.posts.get_attachment',
     {
-      title: 'Download a post attachment to local disk',
+      title: inline ? 'Read a post attachment' : 'Download a post attachment to local disk',
       description:
-        'Download an attachment from a news feed post and write it to a local ' +
-        'temporary file, returning the path. Pass `url` and `name` exactly as ' +
+        (inline
+          ? 'Fetch an attachment from a news feed post and return it: PDFs as ' +
+            'text, images as images. Pass `url` and `name` exactly as '
+          : 'Download an attachment from a news feed post and write it to a local ' +
+            'temporary file, returning the path. Pass `url` and `name` exactly as ') +
         'they appear in the attachments array from `aula.posts.list` — the ' +
         'CloudFront signature is part of the URL, so altering a single ' +
         'character produces a MalformedSignature 403.',
@@ -1232,9 +1410,16 @@ export function registerTools(server: McpServer, context: AulaContext): void {
       },
     },
     async (args) => {
+      const fetched = await fetchAttachment({
+        url: args.url,
+        filename: args.filename,
+        untrustedUrl: true,
+      });
+      if (!fetched.ok) return jsonContent(fetched.result);
+      if (inline) return inlineAttachment({ buf: fetched.buf, filename: args.filename });
       return jsonContent(
-        await downloadAttachmentToDisk({
-          url: args.url,
+        await saveAttachmentToDisk({
+          buf: fetched.buf,
           filename: args.filename,
           prefix: `post-${args.postId}`,
         }),
@@ -1246,8 +1431,10 @@ export function registerTools(server: McpServer, context: AulaContext): void {
   //
   // Aula sends a lot of what parents actually need as PDF attachments —
   // menus, packing lists, trip letters — so downloading one is only half the
-  // job. pdf-parse is imported lazily: it pulls in pdf.js, and a server whose
-  // user never opens a PDF should not pay for that at boot.
+  // job. In inline mode the attachment tools already return the text, and a
+  // tool that reads any local path has no place on a shared server.
+
+  if (inline) return;
 
   server.registerTool(
     'aula.utils.extract_pdf_text',
@@ -1262,34 +1449,22 @@ export function registerTools(server: McpServer, context: AulaContext): void {
       },
     },
     async (args) => {
-      let parser: { getText(): Promise<PdfTextResult>; destroy?(): Promise<void> } | undefined;
+      let data: Buffer;
       try {
-        const { PDFParse } = (await import('pdf-parse')) as unknown as {
-          PDFParse: new (opts: {
-            data: Buffer;
-          }) => {
-            getText(): Promise<PdfTextResult>;
-            destroy?(): Promise<void>;
-          };
-        };
-        parser = new PDFParse({ data: await readFile(args.path) });
-        const result = await parser.getText();
-        return jsonContent({
-          ok: true,
-          text: result.text,
-          pages: result.total,
-          info: result.info,
-        });
+        data = await readFile(args.path);
       } catch (error) {
         return jsonContent({
           ok: false,
           error: 'failed_to_read_pdf',
           message: error instanceof Error ? error.message : String(error),
         });
-      } finally {
-        // v2 holds pdf.js resources open; release them even on the error path.
-        if (parser?.destroy) await parser.destroy();
       }
+      const pdf = await extractPdfText(data);
+      return jsonContent(
+        pdf.ok
+          ? { ok: true, text: pdf.text, pages: pdf.pages, info: pdf.info }
+          : { ok: false, error: 'failed_to_read_pdf', message: pdf.message },
+      );
     },
   );
 }
